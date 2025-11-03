@@ -62,10 +62,45 @@ print("✅ OpenPose model loaded")
 # =========================
 # FastAPI App
 # =========================
+tags_metadata = [
+    {
+        "name": "Health",
+        "description": "Service status and readiness probes.",
+    },
+    {
+        "name": "Upload",
+        "description": "Upload model and cloth images to create a processing session.",
+    },
+    {
+        "name": "Process",
+        "description": "Run the full virtual try-on pipeline for a session.",
+    },
+    {
+        "name": "Result",
+        "description": "Fetch the generated try-on image(s).",
+    },
+    {
+        "name": "Progress",
+        "description": "Realtime pipeline progress over WebSocket.",
+    },
+    {
+        "name": "Sessions",
+        "description": "Manage session lifecycle and cleanup.",
+    },
+]
+
 app = FastAPI(
     title="Virtual Try-On API",
-    description="API for virtual clothing try-on",
-    version="1.0.0"
+    description="REST API for virtual clothing try-on using HR-VITON, OpenPose, Graphonomy, and DensePose.",
+    version="1.0.0",
+    openapi_tags=tags_metadata,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    swagger_ui_parameters={
+        "displayRequestDuration": True,
+        "defaultModelsExpandDepth": -1,
+    },
 )
 
 # CORS để cho phép web truy cập
@@ -327,6 +362,23 @@ class TryOnResponse(BaseModel):
     status: str
     message: str
     result_image_url: Optional[str] = None
+
+
+class UploadResponse(BaseModel):
+    session_id: str
+    status: str
+    message: str
+
+
+class HealthResponse(BaseModel):
+    status: str
+    openpose_model_loaded: bool
+
+
+class DeleteSessionResponse(BaseModel):
+    session_id: str
+    status: str
+    message: str
 
 
 # =========================
@@ -814,7 +866,7 @@ def full_pipeline(session_dir: Path, add_background_flag: bool = True, progress_
 # =========================
 # API Endpoints
 # =========================
-@app.get("/")
+@app.get("/", tags=["Health"], summary="API root metadata")
 async def root():
     return {
         "message": "Virtual Try-On API",
@@ -828,15 +880,52 @@ async def root():
     }
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    tags=["Health"],
+    summary="Health check",
+    response_model=HealthResponse,
+    responses={
+        200: {
+            "description": "Service is healthy",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "status": "healthy",
+                        "openpose_model_loaded": True,
+                    }
+                }
+            },
+        }
+    },
+)
 async def health_check():
-    return {
-        "status": "healthy",
-        "openpose_model_loaded": body_estimation is not None
-    }
+    return HealthResponse(
+        status="healthy",
+        openpose_model_loaded=body_estimation is not None,
+    )
 
 
-@app.post("/upload")
+@app.post(
+    "/upload",
+    tags=["Upload"],
+    summary="Upload model and cloth images",
+    response_model=UploadResponse,
+    responses={
+        200: {
+            "description": "Images uploaded successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "session_id": "f1e2d3c4-5678-90ab-cdef-1234567890ab",
+                        "status": "uploaded",
+                        "message": "Images uploaded successfully. Use /process/{session_id} to start processing.",
+                    }
+                }
+            },
+        }
+    },
+)
 async def upload_images(
     model_image: UploadFile = File(..., description="Ảnh người mẫu"),
     cloth_image: UploadFile = File(..., description="Ảnh quần áo")
@@ -862,11 +951,11 @@ async def upload_images(
             content = await cloth_image.read()
             f.write(content)
         
-        return {
-            "session_id": session_id,
-            "status": "uploaded",
-            "message": "Images uploaded successfully. Use /process/{session_id} to start processing."
-        }
+        return UploadResponse(
+            session_id=session_id,
+            status="uploaded",
+            message="Images uploaded successfully. Use /process/{session_id} to start processing.",
+        )
         
     except Exception as e:
         # Cleanup nếu có lỗi
@@ -874,7 +963,27 @@ async def upload_images(
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
-@app.post("/process/{session_id}")
+@app.post(
+    "/process/{session_id}",
+    tags=["Process"],
+    summary="Run virtual try-on pipeline",
+    response_model=TryOnResponse,
+    responses={
+        200: {
+            "description": "Processing completed successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "session_id": "f1e2d3c4-5678-90ab-cdef-1234567890ab",
+                        "status": "completed",
+                        "message": "Processing completed successfully",
+                        "result_image_url": "/content/Fashion-U-Want-Virtual-Try-On/temp_sessions/f1e2d3c4-5678-90ab-cdef-1234567890ab/output/final_result.png",
+                    }
+                }
+            },
+        }
+    },
+)
 async def process_tryon(
     session_id: str,
     background_tasks: BackgroundTasks,
@@ -919,12 +1028,12 @@ async def process_tryon(
         result_file = result_path[0] if isinstance(result_path, list) and len(result_path) > 0 else result_path
         content_url = build_content_url(result_file if isinstance(result_file, Path) else (session_dir / "output" / "final_result.png"))
 
-        return {
-            "session_id": session_id,
-            "status": "completed",
-            "message": "Processing completed successfully",
-            "result_url": content_url
-        }
+        return TryOnResponse(
+            session_id=session_id,
+            status="completed",
+            message="Processing completed successfully",
+            result_image_url=content_url,
+        )
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
@@ -947,7 +1056,18 @@ async def websocket_progress(websocket: WebSocket, session_id: str):
         return
 
 
-@app.get("/result/{session_id}")
+@app.get(
+    "/result/{session_id}",
+    tags=["Result"],
+    summary="Get result image by session",
+    responses={
+        200: {
+            "description": "PNG image content",
+            "content": {"image/png": {"schema": {"type": "string", "format": "binary"}}},
+        },
+        404: {"description": "Result not found or processing not completed"},
+    },
+)
 async def get_result(session_id: str):
     """
     Lấy ảnh kết quả
@@ -1000,7 +1120,12 @@ async def get_result(session_id: str):
     )
 
 
-@app.delete("/session/{session_id}")
+@app.delete(
+    "/session/{session_id}",
+    tags=["Sessions"],
+    summary="Delete session and cleanup files",
+    response_model=DeleteSessionResponse,
+)
 async def delete_session(session_id: str):
     """
     Xóa session và dọn dẹp file
@@ -1012,11 +1137,11 @@ async def delete_session(session_id: str):
     
     try:
         shutil.rmtree(session_dir)
-        return {
-            "session_id": session_id,
-            "status": "deleted",
-            "message": "Session cleaned up successfully"
-        }
+        return DeleteSessionResponse(
+            session_id=session_id,
+            status="deleted",
+            message="Session cleaned up successfully",
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
 
