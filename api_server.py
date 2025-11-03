@@ -15,6 +15,8 @@ import numpy as np
 from pathlib import Path
 from typing import Optional
 import asyncio
+from datetime import datetime
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
@@ -51,6 +53,36 @@ config.TEMP_DIR.mkdir(exist_ok=True)
 
 # Thread pool để xử lý đồng thời
 executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
+
+# =========================
+# Progress Tracking (in-memory)
+# =========================
+progress_lock = threading.Lock()
+progress_state = {}
+TOTAL_STEPS = 10  # High-level pipeline steps
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+def set_progress(session_id: str, *, step: int, status: str, message: str, result_url: Optional[str] = None):
+    with progress_lock:
+        state = progress_state.get(session_id, {})
+        state.update({
+            "session_id": session_id,
+            "status": status,           # queued | processing | completed | error
+            "message": message,
+            "step": step,
+            "total_steps": TOTAL_STEPS,
+            "updated_at": _now_iso(),
+        })
+        if "started_at" not in state:
+            state["started_at"] = _now_iso()
+        if result_url is not None:
+            state["result_url"] = result_url
+        progress_state[session_id] = state
+
+def report_progress(session_id: str, step: int, message: str):
+    set_progress(session_id, step=step, status="processing", message=message)
 
 # Khởi tạo OpenPose model (global để tái sử dụng)
 print("🔧 Loading OpenPose model...")
@@ -636,11 +668,17 @@ def add_background(result_img_path: Path, mask_img: np.ndarray, background: np.n
     return img
 
 
-def full_pipeline(session_dir: Path, add_background_flag: bool = True):
+def full_pipeline(session_dir: Path, add_background_flag: bool = True, progress_cb=None, session_id: Optional[str] = None):
     """Pipeline xử lý đầy đủ - Following exact logic from main.py"""
     try:
+        current_step = 0
+        if progress_cb and session_id:
+            progress_cb(session_id, current_step, "Starting pipeline")
         # 1. Resize model image to (768, 1024)
         print(f"📏 Step 1: Resizing model image...")
+        current_step = 1
+        if progress_cb and session_id:
+            progress_cb(session_id, current_step, "Resizing model image (768x1024)")
         model_path = session_dir / "input" / "model.jpg"
         print(f"   Reading from: {model_path}")
         print(f"   File exists: {model_path.exists()}")
@@ -666,6 +704,9 @@ def full_pipeline(session_dir: Path, add_background_flag: bool = True):
         
         # 1b. Create resized_img.jpg (384x512) for Graphonomy - IMPORTANT: Main.py does this early
         print(f"📏 Step 1b: Creating resized_img.jpg (384x512)...")
+        current_step = 2
+        if progress_cb and session_id:
+            progress_cb(session_id, current_step, "Preparing resized image (384x512) for Graphonomy")
         print(f"   Reading from: {model_resized_path}")
         
         img_384_512 = cv2.imread(str(model_resized_path))
@@ -682,35 +723,59 @@ def full_pipeline(session_dir: Path, add_background_flag: bool = True):
         
         # 2. Process cloth segmentation
         print(f"\n{'='*60}")
+        current_step = 3
+        if progress_cb and session_id:
+            progress_cb(session_id, current_step, "Running cloth segmentation")
         process_cloth_mask(session_dir)
         
         # 3. Process OpenPose (thay thế OpenPose C++)
         print(f"\n{'='*60}")
+        current_step = 4
+        if progress_cb and session_id:
+            progress_cb(session_id, current_step, "Running OpenPose (PyTorch)")
         process_openpose(model_resized_path, session_dir)
         
         # 4. Process semantic segmentation (includes grayscale conversion)
         print(f"\n{'='*60}")
+        current_step = 5
+        if progress_cb and session_id:
+            progress_cb(session_id, current_step, "Running Graphonomy segmentation")
         mask_img, back_ground = process_segmentation(session_dir)
         
         # 5. Process DensePose
         print(f"\n{'='*60}")
+        current_step = 6
+        if progress_cb and session_id:
+            progress_cb(session_id, current_step, "Running DensePose")
         process_densepose(session_dir)
         
         # 6. Process parse agnostic
         print(f"\n{'='*60}")
+        current_step = 7
+        if progress_cb and session_id:
+            progress_cb(session_id, current_step, "Generating parse agnostic")
         process_parse_agnostic(session_dir)
         
         # 7. Process human agnostic
         print(f"\n{'='*60}")
+        current_step = 8
+        if progress_cb and session_id:
+            progress_cb(session_id, current_step, "Generating human agnostic")
         process_human_agnostic(session_dir)
         
         # 8. Run HR-VITON
         print(f"\n{'='*60}")
+        current_step = 9
+        if progress_cb and session_id:
+            progress_cb(session_id, current_step, "Running HR-VITON generator")
         process_hrviton(session_dir)
         
         # 9. Find result image(s) - Process ALL results like main.py
         print(f"\n{'='*60}")
         print("🖼️ Step 9: Processing final result(s)...")
+        current_step = 10
+        if progress_cb and session_id:
+            progress_cb(session_id, current_step, "Finalizing result images")
         output_dir = session_dir / "HR-VITON" / "Output"
         result_files = sorted(output_dir.glob("*.png"))
         
@@ -841,25 +906,29 @@ async def process_tryon(
     if not model_path.exists() or not cloth_path.exists():
         raise HTTPException(status_code=400, detail="Images not found. Please upload first.")
     
-    try:
-        # Chạy pipeline trong thread pool để không block
-        loop = asyncio.get_event_loop()
-        result_path = await loop.run_in_executor(
-            executor,
-            full_pipeline,
-            session_dir,
-            add_background
-        )
-        
-        return {
-            "session_id": session_id,
-            "status": "completed",
-            "message": "Processing completed successfully",
-            "result_url": f"/result/{session_id}"
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+    # Initialize progress state and start background job
+    set_progress(session_id, step=0, status="queued", message="Queued for processing")
+
+    def _job():
+        try:
+            set_progress(session_id, step=0, status="processing", message="Starting processing")
+            result = full_pipeline(session_dir, add_background_flag=add_background, progress_cb=report_progress, session_id=session_id)
+            set_progress(session_id, step=TOTAL_STEPS, status="completed", message="Completed", result_url=f"/result/{session_id}")
+        except Exception as e:
+            # Preserve last known step on error
+            with progress_lock:
+                last_step = progress_state.get(session_id, {}).get("step", 0)
+            set_progress(session_id, step=last_step, status="error", message=f"Error: {str(e)}")
+
+    executor.submit(_job)
+
+    return {
+        "session_id": session_id,
+        "status": "processing",
+        "message": "Processing started",
+        "progress_url": f"/progress/{session_id}",
+        "result_url": f"/result/{session_id}"
+    }
 
 
 @app.get("/result/{session_id}")
@@ -877,6 +946,16 @@ async def get_result(session_id: str):
         media_type="image/png",
         filename=f"tryon_result_{session_id}.png"
     )
+
+
+@app.get("/progress/{session_id}")
+async def get_progress(session_id: str):
+    """Trả về tiến độ xử lý cho FE polling"""
+    with progress_lock:
+        state = progress_state.get(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return state
 
 
 @app.delete("/session/{session_id}")
