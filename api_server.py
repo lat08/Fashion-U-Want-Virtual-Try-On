@@ -94,6 +94,27 @@ def _safe_progress_emit(progress_cb, event: str, data: dict = None):
     except Exception:
         pass
 
+
+def build_content_url(file_path: Path) -> str:
+    """Build a /content URL for a given file path, supporting Colab and local modes."""
+    # Determine base path exposed via /content endpoint
+    if Path("/content").exists():
+        base_path = Path("/content")
+    else:
+        base_path = config.BASE_DIR
+
+    try:
+        relative_path = file_path.resolve().relative_to(base_path.resolve())
+    except Exception:
+        # Fallback to best-effort relative path
+        try:
+            relative_path = file_path.resolve().relative_to(config.BASE_DIR.resolve())
+        except Exception:
+            relative_path = Path(str(file_path))
+
+    # Normalize separators for URLs
+    return f"/content/{str(relative_path).replace(chr(92), '/')}"
+
 PARSE_COLOR_TO_LABEL = {
     (0, 0, 0): 0,
     (255, 0, 0): 2,
@@ -774,7 +795,7 @@ def full_pipeline(session_dir: Path, add_background_flag: bool = True, progress_
         
         # Return first result path (or list if multiple)
         _safe_progress_emit(progress_cb, "completed", {
-            "result_url": f"/result/{session_dir.name}",
+            "result_url": build_content_url(final_output_paths[0] if len(final_output_paths) >= 1 else (session_dir / "output" / "final_result.png")),
             "num_results": len(final_output_paths)
         })
         return final_output_paths[0] if len(final_output_paths) == 1 else final_output_paths
@@ -894,11 +915,15 @@ async def process_tryon(
             progress_cb
         )
         
+        # Normalize to a single Path for URL building
+        result_file = result_path[0] if isinstance(result_path, list) and len(result_path) > 0 else result_path
+        content_url = build_content_url(result_file if isinstance(result_file, Path) else (session_dir / "output" / "final_result.png"))
+
         return {
             "session_id": session_id,
             "status": "completed",
             "message": "Processing completed successfully",
-            "result_url": f"/result/{session_id}"
+            "result_url": content_url
         }
         
     except Exception as e:
@@ -946,13 +971,32 @@ async def get_result(session_id: str):
     if file_path is None:
         raise HTTPException(status_code=404, detail="Result not found or processing not completed")
 
-    guessed_type, _ = mimetypes.guess_type(str(file_path))
-    media_type = guessed_type or "image/png"
-
-    return FileResponse(
-        file_path,
-        media_type=media_type,
-        headers={"Cache-Control": "public, max-age=0, must-revalidate"}
+    # Read image file as bytes and return with explicit image headers
+    with open(file_path, "rb") as f:
+        image_bytes = f.read()
+    
+    # Return Response with explicit binary content and headers
+    from fastapi.responses import Response
+    
+    return Response(
+        content=image_bytes,
+        media_type="image/png",
+        headers={
+            # CORS headers
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            # Force browser to treat as image
+            "Content-Type": "image/png",
+            "Content-Disposition": f'inline; filename="{file_path.name}"',
+            # Cache control
+            "Cache-Control": "public, max-age=3600",
+            # Prevent ngrok from injecting HTML
+            "X-Content-Type-Options": "nosniff",
+            # Additional headers for binary content
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(len(image_bytes))
+        }
     )
 
 
@@ -975,6 +1019,7 @@ async def delete_session(session_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
+
 
 
 # =========================
