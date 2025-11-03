@@ -847,7 +847,7 @@ def full_pipeline(session_dir: Path, add_background_flag: bool = True, progress_
         
         # Return first result path (or list if multiple)
         _safe_progress_emit(progress_cb, "completed", {
-            "result_url": build_content_url(final_output_paths[0] if len(final_output_paths) >= 1 else (session_dir / "output" / "final_result.png")),
+            "result_url": f"/result/{session_dir.name}",
             "num_results": len(final_output_paths)
         })
         return final_output_paths[0] if len(final_output_paths) == 1 else final_output_paths
